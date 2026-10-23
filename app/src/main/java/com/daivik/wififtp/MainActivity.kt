@@ -16,6 +16,8 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -25,8 +27,12 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.FilterQuality
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
@@ -188,29 +194,70 @@ class MainActivity : ComponentActivity() {
                     Text("START", fontSize = 20.sp, fontWeight = FontWeight.Bold)
                 }
             } else {
-                Card(Modifier.fillMaxWidth()) {
-                    Column(Modifier.padding(20.dp)) {
-                        Text(if (st.paused) "Paused" else "Server running", style = MaterialTheme.typography.labelLarge)
-                        Spacer(Modifier.height(6.dp))
-                        Text(
-                            st.url, fontSize = 24.sp, fontWeight = FontWeight.Bold,
-                            modifier = Modifier.clickable {
-                                ctx.getSystemService(ClipboardManager::class.java)
-                                    .setPrimaryClip(ClipData.newPlainText("ftp", st.url))
-                                Toast.makeText(ctx, "Copied", Toast.LENGTH_SHORT).show()
+                val copyUrl = {
+                    ctx.getSystemService(ClipboardManager::class.java)
+                        .setPrimaryClip(ClipData.newPlainText("ftp", st.url))
+                    Toast.makeText(ctx, "Copied", Toast.LENGTH_SHORT).show()
+                }
+                val qr = remember(st.url) { if (st.url.startsWith("ftp://")) qrBitmap(st.url) else null }
+
+                LazyColumn(Modifier.weight(1f)) {
+                    item {
+                        Card(Modifier.fillMaxWidth()) {
+                            Column(Modifier.padding(20.dp).fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
+                                Text(if (st.paused) "Paused" else "Server running", style = MaterialTheme.typography.labelLarge)
+                                Spacer(Modifier.height(6.dp))
+                                Text(
+                                    st.url, fontSize = 22.sp, fontWeight = FontWeight.Bold,
+                                    modifier = Modifier.clickable { copyUrl() }
+                                )
+                                Spacer(Modifier.height(4.dp))
+                                Text("Type this in your PC file explorer address bar", style = MaterialTheme.typography.bodySmall)
+                                st.pin?.let {
+                                    Spacer(Modifier.height(10.dp))
+                                    Text("Password: $it   (any username)", fontWeight = FontWeight.Medium)
+                                }
+                                Spacer(Modifier.height(12.dp))
+                                OutlinedButton(onClick = { copyUrl() }) { Text("Copy address") }
+                                if (qr != null) {
+                                    Spacer(Modifier.height(14.dp))
+                                    Box(Modifier.background(Color.White).padding(8.dp)) {
+                                        Image(
+                                            bitmap = qr.asImageBitmap(),
+                                            contentDescription = "QR code for the FTP address",
+                                            filterQuality = FilterQuality.None,
+                                            modifier = Modifier.size(170.dp)
+                                        )
+                                    }
+                                    Spacer(Modifier.height(4.dp))
+                                    Text("Scan to open on another device", style = MaterialTheme.typography.bodySmall)
+                                }
                             }
-                        )
-                        Spacer(Modifier.height(4.dp))
-                        Text("Type this in your PC file explorer address bar", style = MaterialTheme.typography.bodySmall)
-                        st.pin?.let {
-                            Spacer(Modifier.height(10.dp))
-                            Text("Password: $it   (any username)", fontWeight = FontWeight.Medium)
                         }
                     }
-                }
-                Spacer(Modifier.height(20.dp))
-                Text("Devices connected: ${st.clients.size}", style = MaterialTheme.typography.titleMedium)
-                LazyColumn(Modifier.weight(1f).padding(top = 8.dp)) {
+                    item {
+                        Spacer(Modifier.height(20.dp))
+                        Row(Modifier.fillMaxWidth()) {
+                            Column(Modifier.weight(1f)) {
+                                Text("↑ Upload (PC → phone)", style = MaterialTheme.typography.bodySmall)
+                                Text(fmtSpeed(st.upSpeed), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                            }
+                            Column(Modifier.weight(1f)) {
+                                Text("↓ Download (phone → PC)", style = MaterialTheme.typography.bodySmall)
+                                Text(fmtSpeed(st.downSpeed), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                            }
+                        }
+                        if (st.transfers.isNotEmpty()) {
+                            Spacer(Modifier.height(8.dp))
+                            st.transfers.take(4).forEach {
+                                Text(it, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodyMedium)
+                            }
+                            if (st.transfers.size > 4) Text("+${st.transfers.size - 4} more", style = MaterialTheme.typography.bodySmall)
+                        }
+                        Spacer(Modifier.height(20.dp))
+                        Text("Devices connected: ${st.clients.size}", style = MaterialTheme.typography.titleMedium)
+                        Spacer(Modifier.height(8.dp))
+                    }
                     items(st.clients) { c ->
                         Column(Modifier.padding(vertical = 6.dp)) {
                             Text(c.ip, fontWeight = FontWeight.Medium)
@@ -218,6 +265,7 @@ class MainActivity : ComponentActivity() {
                         }
                     }
                 }
+                Spacer(Modifier.height(12.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                     OutlinedButton(
                         onClick = { FtpService.send(ctx, if (st.paused) FtpService.ACTION_RESUME else FtpService.ACTION_PAUSE) },
@@ -230,6 +278,23 @@ class MainActivity : ComponentActivity() {
                     ) { Text("Disconnect") }
                 }
             }
+        }
+
+        st.pending.firstOrNull()?.let { p ->
+            AlertDialog(
+                onDismissRequest = {},
+                title = { Text("Allow connection?") },
+                text = {
+                    Column {
+                        Text(p.ip, fontWeight = FontWeight.Bold)
+                        Text(if (p.host != p.ip) p.host else "Hostname unavailable", style = MaterialTheme.typography.bodySmall)
+                        Spacer(Modifier.height(10.dp))
+                        Text("This device wants to access your shared files.")
+                    }
+                },
+                confirmButton = { TextButton(onClick = { FtpService.send(ctx, FtpService.ACTION_ALLOW, p.ip) }) { Text("Allow") } },
+                dismissButton = { TextButton(onClick = { FtpService.send(ctx, FtpService.ACTION_BLOCK, p.ip) }) { Text("Block") } }
+            )
         }
     }
 }

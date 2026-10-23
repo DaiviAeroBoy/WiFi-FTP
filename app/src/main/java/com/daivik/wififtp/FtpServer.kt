@@ -7,6 +7,7 @@ import java.text.SimpleDateFormat
 import java.util.*
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ExecutorService
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicLong
 
@@ -17,6 +18,12 @@ class FtpServer(private val port: Int, private val fs: VirtualFs, private val pi
     private val sessions = ConcurrentHashMap<Long, Session>()
     private val hosts = ConcurrentHashMap<String, String>()
     private val ids = AtomicLong()
+    private val tids = AtomicLong()
+    private val bytesUp = AtomicLong()    // PC -> phone
+    private val bytesDown = AtomicLong()  // phone -> PC
+    private val active = ConcurrentHashMap<Long, String>()
+    private val pendingIps: MutableSet<String> = ConcurrentHashMap.newKeySet()
+    private val ticker = Executors.newSingleThreadScheduledExecutor()
     @Volatile private var running = false
 
     fun start() {
@@ -25,6 +32,24 @@ class FtpServer(private val port: Int, private val fs: VirtualFs, private val pi
         ss.bind(InetSocketAddress(port))
         server = ss
         running = true
+        var lastUp = 0L
+        var lastDown = 0L
+        var lastT = System.nanoTime()
+        ticker.scheduleAtFixedRate(Runnable {
+            try {
+                val now = System.nanoTime()
+                val dt = (now - lastT) / 1e9
+                lastT = now
+                val u = bytesUp.get()
+                val d = bytesDown.get()
+                val upS = ((u - lastUp) / dt).toLong()
+                val dnS = ((d - lastDown) / dt).toLong()
+                lastUp = u
+                lastDown = d
+                val names = active.values.sorted()
+                ServerState.state.update { it.copy(upSpeed = upS, downSpeed = dnS, transfers = names) }
+            } catch (e: Exception) {}
+        }, 1, 1, TimeUnit.SECONDS)
         pool.execute {
             while (running) {
                 try {
@@ -47,18 +72,48 @@ class FtpServer(private val port: Int, private val fs: VirtualFs, private val pi
         sessions.values.forEach { it.close() }
         sessions.clear()
         pool.shutdownNow()
+        ticker.shutdownNow()
+        active.clear()
+        pendingIps.clear()
+        publish()
+        ServerState.state.update { it.copy(upSpeed = 0, downSpeed = 0, transfers = emptyList()) }
+    }
+
+    /** Called from the allow/block pop-up or notification. */
+    fun decide(ip: String, allow: Boolean) {
+        if (allow) {
+            Access.blocked.remove(ip); Access.allowed.add(ip)
+        } else {
+            Access.allowed.remove(ip); Access.blocked.add(ip)
+            sessions.values.filter { it.ip == ip }.forEach { it.close() }
+        }
+        pendingIps.remove(ip)
         publish()
     }
 
+    private fun beginTransfer(label: String): Long {
+        val id = tids.incrementAndGet()
+        active[id] = label
+        ServerState.state.update { it.copy(transfers = active.values.sorted()) }
+        return id
+    }
+
+    private fun endTransfer(id: Long) {
+        active.remove(id)
+        ServerState.state.update { it.copy(transfers = active.values.sorted()) }
+    }
+
     private fun publish() {
-        val list = sessions.values.groupBy { it.ip }
+        val list = sessions.values.filter { it.approved }.groupBy { it.ip }
             .map { (ip, l) -> ClientInfo(ip, hosts[ip] ?: ip, l.size) }
             .sortedBy { it.ip }
-        ServerState.state.update { it.copy(clients = list) }
+        val pend = pendingIps.map { Pending(it, hosts[it] ?: it) }.sortedBy { it.ip }
+        ServerState.state.update { it.copy(clients = list, pending = pend) }
     }
 
     inner class Session(val id: Long, private val sock: Socket) : Runnable {
         val ip: String = sock.inetAddress.hostAddress ?: "unknown"
+        @Volatile var approved = false
         private val input = BufferedReader(InputStreamReader(sock.getInputStream(), Charsets.UTF_8))
         private val out = BufferedOutputStream(sock.getOutputStream())
         private var cwd = "/"
@@ -82,6 +137,12 @@ class FtpServer(private val port: Int, private val fs: VirtualFs, private val pi
         override fun run() {
             try {
                 sock.soTimeout = 15 * 60 * 1000
+                if (!waitApproval()) {
+                    try { reply(421, "Connection not allowed") } catch (e: Exception) {}
+                    return
+                }
+                approved = true
+                publish()
                 reply(220, "WiFi FTP ready")
                 while (true) {
                     val line = input.readLine() ?: break
@@ -96,6 +157,27 @@ class FtpServer(private val port: Int, private val fs: VirtualFs, private val pi
                 close()
                 sessions.remove(id)
                 publish()
+            }
+        }
+
+        private fun waitApproval(): Boolean {
+            if (Access.blocked.contains(ip)) return false
+            if (Access.allowed.contains(ip)) return true
+            pendingIps.add(ip)
+            publish()
+            val end = System.currentTimeMillis() + 45_000
+            try {
+                while (running && System.currentTimeMillis() < end && !sock.isClosed) {
+                    if (Access.allowed.contains(ip)) return true
+                    if (Access.blocked.contains(ip)) return false
+                    Thread.sleep(200)
+                }
+                return false
+            } finally {
+                if (!Access.allowed.contains(ip) && !Access.blocked.contains(ip)) {
+                    pendingIps.remove(ip)
+                    publish()
+                }
             }
         }
 
@@ -152,12 +234,13 @@ class FtpServer(private val port: Int, private val fs: VirtualFs, private val pi
             return "$perm 1 ftp ftp $size ${fmt.format(Date(f.lastModified()))} $name\r\n"
         }
 
-        private fun copy(ins: InputStream, os: OutputStream) {
+        private fun copy(ins: InputStream, os: OutputStream, counter: AtomicLong) {
             val buf = ByteArray(256 * 1024)
             while (true) {
                 val n = ins.read(buf)
                 if (n < 0) break
                 os.write(buf, 0, n)
+                counter.addAndGet(n.toLong())
             }
             os.flush()
         }
@@ -250,13 +333,14 @@ class FtpServer(private val port: Int, private val fs: VirtualFs, private val pi
                     if (f == null || !f.isFile) { reply(550, "File not found"); return true }
                     reply(150, "Sending")
                     val d = openData() ?: run { reply(425, "Can't open data connection"); return true }
+                    val tid = beginTransfer("↓ ${f.name}")
                     try {
                         FileInputStream(f).use { ins ->
                             if (rest > 0) ins.channel.position(rest)
-                            d.getOutputStream().use { os -> copy(ins, os) }
+                            d.getOutputStream().use { os -> copy(ins, os, bytesDown) }
                         }
                         reply(226, "Transfer complete")
-                    } catch (e: IOException) { reply(426, "Transfer aborted"); try { d.close() } catch (x: Exception) {} }
+                    } catch (e: IOException) { reply(426, "Transfer aborted"); try { d.close() } catch (x: Exception) {} } finally { endTransfer(tid) }
                     rest = 0
                 }
                 "STOR", "APPE" -> {
@@ -267,12 +351,13 @@ class FtpServer(private val port: Int, private val fs: VirtualFs, private val pi
                     }
                     reply(150, "Receiving")
                     val d = openData() ?: run { reply(425, "Can't open data connection"); return true }
+                    val tid = beginTransfer("↑ ${f.name}")
                     try {
                         d.getInputStream().use { ins ->
-                            FileOutputStream(f, cmd == "APPE").use { os -> copy(ins, os) }
+                            FileOutputStream(f, cmd == "APPE").use { os -> copy(ins, os, bytesUp) }
                         }
                         reply(226, "Transfer complete")
-                    } catch (e: IOException) { reply(426, "Transfer aborted"); try { d.close() } catch (x: Exception) {} }
+                    } catch (e: IOException) { reply(426, "Transfer aborted"); try { d.close() } catch (x: Exception) {} } finally { endTransfer(tid) }
                     rest = 0
                 }
                 "DELE" -> {
